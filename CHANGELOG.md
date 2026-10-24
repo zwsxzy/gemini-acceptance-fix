@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+- Send `CancelCascadeInvocation` for cancelled or timed-out local runs, skip
+  cancelled queued work, and prevent late results or errors from replacing a
+  cancelled state.
+- Finish and persist jobs when a worker raises an unexpected exception.
+- Serialize history writes and use separate atomic temporary files.
+- Validate malformed request objects, model arguments, paths, and job limits.
+- Support an optional `model` argument for synchronous code searches.
+- Bound context reads before loading large files and include response text in
+  completion detection so changing output resets the settle window.
+- Complete REST model discovery and pagination, default model resolution,
+  configured timeouts, usage capture, and incomplete-response error handling.
+
 ## [1.1.0] — 2026-09-13
 
 First public release.

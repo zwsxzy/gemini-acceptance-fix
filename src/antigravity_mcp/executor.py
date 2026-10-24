@@ -9,15 +9,20 @@ than inventing a result.
 
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.request
 from typing import Optional
+from urllib.parse import urlencode
 
 from .antigravity_local import (
     AntigravityLocalExecutor,
+    ModelInfo,
     collect_file_contexts,
+    describe_available_models,
     discover_language_server,
+    resolve_model_id,
 )
 from .job_manager import Job
 
@@ -53,33 +58,108 @@ class AgentExecutor:
         context_files: Optional[list[str]] = None,
         system_instruction: Optional[str] = None,
     ) -> None:
-        # Priority 1: Local Antigravity Language Server
-        if os.environ.get("ANTIGRAVITY_DISABLE_LOCAL", "").lower() not in ("1", "true"):
-            endpoint = discover_language_server()
-            if endpoint:
-                local_exec = AntigravityLocalExecutor(endpoint=endpoint, timeout=self.timeout)
-                local_exec.run_job_sync(
+        if job.is_cancelled():
+            return
+        try:
+            # Priority 1: Local Antigravity Language Server
+            if os.environ.get("ANTIGRAVITY_DISABLE_LOCAL", "").lower() not in ("1", "true"):
+                endpoint = discover_language_server()
+                if endpoint:
+                    local_exec = AntigravityLocalExecutor(endpoint=endpoint, timeout=self.timeout)
+                    local_exec.run_job_sync(
+                        job, context_files=context_files, system_instruction=system_instruction
+                    )
+                    return
+
+            # Priority 2: Gemini REST API (if GEMINI_API_KEY is set)
+            if self.api_key:
+                self._run_gemini_rest(
                     job, context_files=context_files, system_instruction=system_instruction
                 )
                 return
 
-        # Priority 2: Gemini REST API (if GEMINI_API_KEY is set)
-        if self.api_key:
-            self._run_gemini_rest(
-                job, context_files=context_files, system_instruction=system_instruction
-            )
-            return
+            if job.start():
+                job.fail(
+                    "No execution backend available. "
+                    "Ensure the Antigravity IDE is running (with its language server active), "
+                    "or set GEMINI_API_KEY in the environment for cloud execution."
+                )
+                job.log("Execution failed: No available backend.")
+        except Exception as exc:
+            job.fail(f"{type(exc).__name__}: {exc}")
+            job.log(f"Execution failed: {exc}")
 
-        # No backend available -> fail loudly
-        job.started_at = time.time()
-        job.status = "failed"
-        job.finished_at = time.time()
-        job.error = (
-            "No execution backend available. "
-            "Ensure the Antigravity IDE is running (with its language server active), "
-            "or set GEMINI_API_KEY in the environment for cloud execution."
+    def describe_available_models(self) -> str:
+        if (
+            os.environ.get("ANTIGRAVITY_DISABLE_LOCAL", "").lower() not in ("1", "true")
+            and discover_language_server()
+        ):
+            return describe_available_models()
+        if not self.api_key:
+            raise RuntimeError(
+                "No execution backend available. Open Antigravity or set GEMINI_API_KEY."
+            )
+        models = self._list_rest_models(time.monotonic() + self.timeout)
+        lines = [f"{len(models)} models available (Gemini REST API):"]
+        lines.extend(
+            f'  - "{m.model_id}" ({m.label})' for m in sorted(models, key=lambda m: m.model_id)
         )
-        job.log("Execution failed: No available backend.")
+        lines.append(
+            "\nPass an exact model ID or a model family such as 'flash' to dispatch_gemini_agent."
+        )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _remaining(deadline: float) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Gemini REST execution timed out.")
+        return remaining
+
+    def _rest_request(self, path: str, deadline: float, payload=None) -> dict:
+        req = urllib.request.Request(
+            f"https://generativelanguage.googleapis.com/v1beta/{path}",
+            data=json.dumps(payload).encode("utf-8") if payload is not None else None,
+            headers={"Content-Type": "application/json", "x-goog-api-key": self.api_key},
+        )
+        with urllib.request.urlopen(req, timeout=self._remaining(deadline)) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        self._remaining(deadline)
+        if not isinstance(result, dict):
+            raise ValueError("Gemini REST returned a non-object response.")
+        return result
+
+    def _list_rest_models(self, deadline: float) -> list[ModelInfo]:
+        models = {}
+        page_token = None
+        seen_tokens = set()
+        while True:
+            params = {"pageSize": 1000}
+            if page_token:
+                params["pageToken"] = page_token
+            data = self._rest_request(f"models?{urlencode(params)}", deadline)
+            for model in data.get("models", []):
+                name = model.get("name", "")
+                if (
+                    "generateContent" in model.get("supportedGenerationMethods", [])
+                    and isinstance(name, str)
+                    and re.fullmatch(r"models/[A-Za-z0-9._-]+", name)
+                ):
+                    model_id = name.removeprefix("models/")
+                    models[model_id] = ModelInfo(
+                        label=model.get("displayName") or model_id,
+                        model_id=model_id,
+                        raw=model,
+                    )
+            page_token = data.get("nextPageToken")
+            if not page_token:
+                break
+            if page_token in seen_tokens:
+                raise ValueError("Gemini REST returned a repeated models page token.")
+            seen_tokens.add(page_token)
+        if not models:
+            raise ValueError("Gemini REST returned no models supporting generateContent.")
+        return list(models.values())
 
     def _run_gemini_rest(
         self,
@@ -87,21 +167,25 @@ class AgentExecutor:
         context_files: Optional[list[str]] = None,
         system_instruction: Optional[str] = None,
     ) -> None:
-        job.started_at = time.time()
-        job.status = "running"
-        job.log(f"Started job on Gemini REST API with model {job.model}")
-
-        context_str = ""
-        if context_files:
-            job.log(f"Reading {len(context_files)} context files...")
-            context_str = collect_file_contexts(context_files)
-            job.log(f"Context gathered ({len(context_str)} characters).")
-
-        if job.is_cancelled():
+        if not job.start():
             return
-
+        job.log(f"Started job on Gemini REST API with model {job.model}")
+        deadline = time.monotonic() + self.timeout
         try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{job.model}:generateContent?key={self.api_key}"
+            context_str = ""
+            if context_files:
+                job.log(f"Reading {len(context_files)} context files...")
+                context_str = collect_file_contexts(context_files)
+                job.log(f"Context gathered ({len(context_str)} characters).")
+            if job.is_cancelled():
+                return
+            models = self._list_rest_models(deadline)
+            # The API's resource prefix is accepted as well as the short ID.
+            model_id = resolve_model_id(job.model.removeprefix("models/"), models)
+            job.metadata["resolved_model"] = model_id
+            job.log(f"Resolved REST model '{job.model}' -> '{model_id}'")
+            if job.is_cancelled():
+                return
 
             system_prompt = system_instruction or (
                 "You are an expert AI software engineer and background subagent worker assisting a lead architect. "
@@ -119,36 +203,28 @@ class AgentExecutor:
                 "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8192},
             }
 
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-            )
-
             job.log("Dispatching request to Gemini REST endpoint...")
-            with urllib.request.urlopen(req, timeout=120) as response:
-                if job.is_cancelled():
-                    return
-                resp_data = json.loads(response.read().decode("utf-8"))
-                candidates = resp_data.get("candidates", [])
-                if candidates:
-                    first_cand = candidates[0]
-                    content = first_cand.get("content", {})
-                    resp_parts = content.get("parts", [])
-                    job.result = "".join(p.get("text", "") for p in resp_parts)
-                    job.status = "completed"
-                    job.finished_at = time.time()
-                    job.log("Response received and processed.")
-                else:
-                    job.error = f"No candidate in response: {resp_data}"
-                    job.status = "failed"
-                    job.finished_at = time.time()
-                    job.log("Failed: No candidate returned.")
+            resp_data = self._rest_request(f"models/{model_id}:generateContent", deadline, payload)
+            if job.is_cancelled():
+                return
+            candidates = resp_data.get("candidates", [])
+            if not candidates:
+                reason = resp_data.get("promptFeedback", {}).get("blockReason", "no candidate")
+                raise ValueError(f"Gemini returned no candidate: {reason}")
+            candidate = candidates[0]
+            finish_reason = candidate.get("finishReason")
+            if finish_reason != "STOP":
+                raise ValueError(f"Gemini generation did not finish completely: {finish_reason}")
+            parts = candidate.get("content", {}).get("parts", [])
+            result = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+            if not result.strip():
+                raise ValueError("Gemini returned an empty text response.")
+            job.metadata["model_usage"] = resp_data.get("usageMetadata", {})
+            if job.complete(result):
+                job.log("Response received and processed.")
 
         except Exception as e:
-            job.error = str(e)
-            job.status = "failed"
-            job.finished_at = time.time()
+            job.fail(str(e))
             job.log(f"Error during execution: {e}")
 
 

@@ -273,12 +273,10 @@ def collect_file_contexts(file_paths: list[str], max_total_chars: int = 500_000)
             continue
         try:
             with open(path, encoding="utf-8", errors="replace") as f:
-                content = f.read()
-                if total_chars + len(content) > max_total_chars:
-                    content = (
-                        content[: max_total_chars - total_chars]
-                        + "\n... [TRUNCATED DUE TO SIZE LIMIT]"
-                    )
+                remaining = max(0, max_total_chars - total_chars)
+                content = f.read(remaining + 1)
+                if len(content) > remaining:
+                    content = content[:remaining] + "\n... [TRUNCATED DUE TO SIZE LIMIT]"
                 blocks.append(f"\n--- File: {path} ---\n{content}\n")
                 total_chars += len(content)
                 if total_chars >= max_total_chars:
@@ -352,21 +350,32 @@ class AntigravityLocalExecutor:
         self.endpoint = endpoint
         self.timeout = timeout
 
+    @staticmethod
+    def _stop_cascade(endpoint: LanguageServerEndpoint, cascade_id: str, job: Job) -> None:
+        # Cancelling our polling loop does not stop the IDE's model/tools.
+        # CancelCascadeInvocation is the engine's stop operation; cancellation
+        # must target the same endpoint and Cascade created for this job.
+        try:
+            _rpc_call(endpoint, "CancelCascadeInvocation", {"cascadeId": cascade_id}, timeout=5.0)
+            job.metadata["engine_stop_requested"] = True
+            job.log("Language server acknowledged the Cascade stop request.")
+        except Exception as exc:
+            job.metadata["engine_stop_requested"] = False
+            job.log(f"WARNING: could not stop the underlying Cascade: {exc}")
+
     def run_job_sync(
         self,
         job: Job,
         context_files: Optional[list[str]] = None,
         system_instruction: Optional[str] = None,
     ) -> None:
-        job.started_at = time.time()
-        job.status = "running"
+        if not job.start():
+            return
 
         # 1. Discover or validate endpoint
         endpoint = self.endpoint or discover_language_server()
         if not endpoint:
-            job.error = "Antigravity language server is not running or unreachable."
-            job.status = "failed"
-            job.finished_at = time.time()
+            job.fail("Antigravity language server is not running or unreachable.")
             job.log("Failed: No active Antigravity IDE language server discovered.")
             return
 
@@ -381,9 +390,7 @@ class AntigravityLocalExecutor:
             resolved_label = next((m.label for m in available if m.model_id == model_id), model_id)
             job.log(f"Resolved model '{job.model}' -> '{resolved_label}' ({model_id})")
         except Exception as e:
-            job.error = str(e)
-            job.status = "failed"
-            job.finished_at = time.time()
+            job.fail(str(e))
             job.log(f"Model resolution failed: {e}")
             return
 
@@ -416,15 +423,16 @@ class AntigravityLocalExecutor:
                 "requestedModel": model_id,
             }
             job.log(f"Starting Cascade session `{cascade_id}`...")
-            _rpc_call(endpoint, "StartCascade", start_payload, timeout=10.0)
+            start_response = _rpc_call(endpoint, "StartCascade", start_payload, timeout=10.0)
+            cascade_id = start_response.get("cascadeId") or cascade_id
+            job.metadata["cascade_id"] = cascade_id
         except Exception as e:
-            job.error = f"StartCascade RPC failed: {e}"
-            job.status = "failed"
-            job.finished_at = time.time()
+            job.fail(f"StartCascade RPC failed: {e}")
             job.log(f"Failed in StartCascade: {e}")
             return
 
         if job.is_cancelled():
+            self._stop_cascade(endpoint, cascade_id, job)
             return
 
         # 5. SendUserCascadeMessage
@@ -437,9 +445,8 @@ class AntigravityLocalExecutor:
             job.log("Submitting prompt to local agent...")
             _rpc_call(endpoint, "SendUserCascadeMessage", msg_payload, timeout=10.0)
         except Exception as e:
-            job.error = f"SendUserCascadeMessage RPC failed: {e}"
-            job.status = "failed"
-            job.finished_at = time.time()
+            self._stop_cascade(endpoint, cascade_id, job)
+            job.fail(f"SendUserCascadeMessage RPC failed: {e}")
             job.log(f"Failed in SendUserCascadeMessage: {e}")
             return
 
@@ -457,17 +464,20 @@ class AntigravityLocalExecutor:
 
         while True:
             if job.is_cancelled():
+                self._stop_cascade(endpoint, cascade_id, job)
                 return
 
             if time.time() - start_poll_time > self.timeout:
-                job.error = f"Antigravity agent execution timed out after {self.timeout}s"
-                job.status = "failed"
-                job.finished_at = time.time()
+                self._stop_cascade(endpoint, cascade_id, job)
+                job.fail(f"Antigravity agent execution timed out after {self.timeout}s")
                 job.log("Timed out waiting for response.")
                 return
 
             time.sleep(poll_interval)
             poll_interval = min(poll_interval * 1.3, max_poll_interval)
+            if job.is_cancelled():
+                self._stop_cascade(endpoint, cascade_id, job)
+                return
 
             try:
                 traj_resp = _rpc_call(
@@ -475,14 +485,16 @@ class AntigravityLocalExecutor:
                 )
             except urllib.error.URLError as e:
                 # Connection refused or socket error indicates IDE was closed
-                job.error = f"Antigravity IDE session ended (connection refused: {e})"
-                job.status = "failed"
-                job.finished_at = time.time()
+                job.fail(f"Antigravity IDE session ended (connection refused: {e})")
                 job.log(f"Connection lost to language server: {e}")
                 return
             except Exception as e:
                 job.log(f"Trajectory poll warning: {e}")
                 continue
+
+            if job.is_cancelled():
+                self._stop_cascade(endpoint, cascade_id, job)
+                return
 
             steps = traj_resp.get("trajectory", {}).get("steps", [])
 
@@ -501,9 +513,7 @@ class AntigravityLocalExecutor:
                     if full_err:
                         job.log(f"Internal engine stack trace:\n{full_err}")
 
-                    job.error = short_err
-                    job.status = "failed"
-                    job.finished_at = time.time()
+                    job.fail(short_err)
                     job.log(f"Agent execution error: {short_err}")
                     finished = True
                     break
@@ -543,7 +553,15 @@ class AntigravityLocalExecutor:
             #   3. the step list has stopped changing for _SETTLE_SECONDS.
             # (3) matters because steps arrive in bursts a second or two apart,
             # so (1) and (2) both hold briefly in the middle of a run.
-            signature = tuple((s.get("type"), s.get("status")) for s in steps)
+            signature = tuple(
+                (
+                    s.get("type"),
+                    s.get("status"),
+                    s.get("plannerResponse", {}).get("modifiedResponse")
+                    or s.get("plannerResponse", {}).get("response"),
+                )
+                for s in steps
+            )
             if signature != last_signature:
                 last_signature = signature
                 last_change_at = time.time()
@@ -553,7 +571,15 @@ class AntigravityLocalExecutor:
             last_type = last_step.get("type") if last_step else None
             # Something must have been said, or there is nothing to return and
             # the run cannot be over however settled the step list looks.
-            has_response = any(s.get("type") == "CORTEX_STEP_TYPE_PLANNER_RESPONSE" for s in steps)
+            has_response = any(
+                s.get("type") == "CORTEX_STEP_TYPE_PLANNER_RESPONSE"
+                and (
+                    s.get("plannerResponse", {}).get("modifiedResponse")
+                    or s.get("plannerResponse", {}).get("response")
+                    or ""
+                ).strip()
+                for s in steps
+            )
             ended = (
                 not busy
                 and has_response
@@ -592,9 +618,10 @@ class AntigravityLocalExecutor:
                     except (TypeError, ValueError):
                         pass
 
-            job.result = "\n\n".join(chunks)
-            job.status = "completed"
-            job.finished_at = time.time()
+            if not job.complete("\n\n".join(chunks)):
+                if job.is_cancelled():
+                    self._stop_cascade(endpoint, cascade_id, job)
+                return
             if total_in or total_out:
                 job.log(f"Model usage: inTokens={total_in}, outTokens={total_out}")
             job.log(

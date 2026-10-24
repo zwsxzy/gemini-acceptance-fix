@@ -23,7 +23,7 @@ from typing import Any, Callable, Optional
 from . import __version__, protocol
 from .antigravity_local import describe_available_models
 from .executor import AgentExecutor
-from .job_manager import JobManager
+from .job_manager import Job, JobManager
 
 logging.basicConfig(
     level=os.environ.get("ANTIGRAVITY_LOG_LEVEL", "INFO").upper(),
@@ -94,7 +94,8 @@ TOOLS = [
                         "The live catalog (versions, families, and thinking-effort tiers) "
                         "changes over time and depends on the connected Antigravity IDE "
                         "session — call list_available_models rather than assuming a name. "
-                        "Defaults to the fastest available flash-tier model."
+                        "Defaults to an available Flash model, preferring the highest "
+                        "thinking-effort tier and then the newest version."
                     ),
                 },
                 "system_instruction": {
@@ -108,8 +109,8 @@ TOOLS = [
     {
         "name": "list_available_models",
         "description": (
-            "List the live models currently available from the connected Antigravity IDE "
-            "session. Call this before dispatch_gemini_agent when you do not already know "
+            "List the live models available from the Antigravity IDE or Gemini REST "
+            "fallback. Call this before dispatch_gemini_agent when you do not already know "
             "an exact, currently-live model name."
         ),
         "inputSchema": {"type": "object", "properties": {}},
@@ -169,6 +170,10 @@ TOOLS = [
                     "items": {"type": "string"},
                     "description": "Absolute paths of the files to scan.",
                 },
+                "model": {
+                    "type": "string",
+                    "description": "Optional live model label or ID for this search; defaults to Flash.",
+                },
             },
             "required": ["query", "context_files"],
         },
@@ -225,13 +230,16 @@ class MCPServer:
 
         req_id = req.get("id")
         method = req.get("method")
-        params = req.get("params") or {}
+        params = req.get("params", {})
 
         # A request without an id is a notification: act on it, answer nothing.
         if req_id is None:
             if method in ("notifications/initialized", "notifications/cancelled"):
                 logger.debug("Received notification: %s", method)
             return None
+
+        if not isinstance(params, dict):
+            return self._error(req_id, INVALID_PARAMS, "Request params must be a JSON object.")
 
         # Modern requests declare their version and capabilities per request, and
         # one declaring a version we do not implement must be refused here rather
@@ -275,7 +283,7 @@ class MCPServer:
             )
 
         if method == "tools/call":
-            return self._call_tool(req_id, params.get("name"), params.get("arguments") or {})
+            return self._call_tool(req_id, params.get("name"), params.get("arguments", {}))
 
         return self._error(req_id, METHOD_NOT_FOUND, f"Method not found: {method}")
 
@@ -295,6 +303,10 @@ class MCPServer:
         }
 
     def _call_tool(self, req_id: Any, name: Optional[str], args: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(name, str) or not isinstance(args, dict):
+            return self._error(
+                req_id, INVALID_PARAMS, "Tool name must be a string and arguments an object."
+            )
         handler = self._handlers.get(name or "")
         if handler is None:
             # An unknown tool is a protocol-level mistake by the client, not a
@@ -320,19 +332,21 @@ class MCPServer:
 
     @staticmethod
     def _optional_paths(args: dict[str, Any], key: str) -> list:
-        value = args.get(key) or []
-        if not isinstance(value, list) or not all(isinstance(p, str) for p in value):
-            raise ToolInputError(f"'{key}' must be an array of file path strings.")
+        value = args.get(key, [])
+        if not isinstance(value, list) or not all(isinstance(p, str) and p.strip() for p in value):
+            raise ToolInputError(f"'{key}' must be an array of non-empty file path strings.")
         return value
 
     def _tool_dispatch_agent(self, args: dict[str, Any]) -> str:
         task = self._require_str(args, "task")
         files = self._optional_paths(args, "context_files")
-        model = args.get("model") or "flash"
-        system_instruction = args.get("system_instruction")
+        model = self._require_str(args, "model") if "model" in args else "flash"
+        system_instruction = (
+            self._require_str(args, "system_instruction") if "system_instruction" in args else None
+        )
 
         job = self.job_manager.create_job(task=task, model=model, metadata={"context_files": files})
-        self._job_pool.submit(self.executor.run_job_sync, job, files, system_instruction)
+        self._job_pool.submit(self._run_job, job, files, system_instruction)
 
         return (
             f"✅ **Subagent dispatched**\n"
@@ -345,7 +359,20 @@ class MCPServer:
         )
 
     def _tool_list_models(self, args: dict[str, Any]) -> str:
-        return describe_available_models()
+        describe = getattr(self.executor, "describe_available_models", describe_available_models)
+        return describe()
+
+    def _run_job(self, job: Job, files: list[str], system_instruction: Optional[str]) -> None:
+        if job.is_cancelled():
+            return
+        try:
+            self.executor.run_job_sync(job, files, system_instruction)
+            if job.status in ("pending", "running"):
+                job.fail("Executor exited without a terminal job status.")
+        except Exception as exc:
+            logger.exception("Background job %s failed", job.id)
+            job.fail(f"{type(exc).__name__}: {exc}")
+            job.log(f"Worker execution failed: {exc}")
 
     def _tool_check_job(self, args: dict[str, Any]) -> str:
         job_id = self._require_str(args, "job_id")
@@ -354,32 +381,35 @@ class MCPServer:
             raise ToolInputError(f"Job '{job_id}' not found.")
 
         snapshot = job.to_dict()
+        status = snapshot["status"]
         duration = snapshot["duration_seconds"]
         logs = "\n".join(f"  {line}" for line in snapshot["progress_logs"])
 
-        if job.status == "running":
+        if status == "running":
             return (
                 f"⏳ **Job `{job.id}` is RUNNING**\n"
-                f"- **Model**: `{job.model}`\n"
+                f"- **Model**: `{snapshot['model']}`\n"
                 f"- **Elapsed**: {duration}s\n"
                 f"- **Logs**:\n{logs}\n\n"
                 f"*Still processing — check again shortly.*"
             )
-        if job.status == "pending":
+        if status == "pending":
             return (
                 f"🕒 **Job `{job.id}` is QUEUED**\n"
-                f"- **Model**: `{job.model}`\n"
+                f"- **Model**: `{snapshot['model']}`\n"
                 f"- Waiting for one of {MAX_CONCURRENT_JOBS} concurrent slots to free up."
             )
-        if job.status == "completed":
-            return f"🎉 **Job `{job.id}` COMPLETED** ({duration}s)\n\n### Output:\n{job.result}"
-        if job.status == "cancelled":
+        if status == "completed":
+            return f"🎉 **Job `{job.id}` COMPLETED** ({duration}s)\n\n### Output:\n{snapshot['result']}"
+        if status == "cancelled":
             return f"🚫 **Job `{job.id}` was CANCELLED**\n\nLogs:\n{logs}"
-        return f"❌ **Job `{job.id}` FAILED**\n- **Error**: {job.error}\n- **Logs**:\n{logs}"
+        return (
+            f"❌ **Job `{job.id}` FAILED**\n- **Error**: {snapshot['error']}\n- **Logs**:\n{logs}"
+        )
 
     def _tool_list_jobs(self, args: dict[str, Any]) -> str:
         limit = args.get("limit", 10)
-        if not isinstance(limit, int) or limit < 1:
+        if type(limit) is not int or limit < 1:
             raise ToolInputError("'limit' must be a positive integer.")
         jobs = self.job_manager.list_jobs(limit=limit)
         if not jobs:
@@ -404,19 +434,22 @@ class MCPServer:
         files = self._optional_paths(args, "context_files")
         if not files:
             raise ToolInputError("'context_files' must list at least one file to scan.")
+        model = self._require_str(args, "model") if "model" in args else "flash"
 
         # Routed through the job pool so a search counts against the same
         # concurrency budget as a dispatched job — they contend for the one
         # language server process either way. This call blocks its own request
         # thread waiting for the answer, but not the stdio read loop.
-        job = self.job_manager.create_job(task=query, model="flash", metadata={"search": True})
-        future = self._job_pool.submit(
-            self.executor.run_job_sync, job, files, SEARCH_SYSTEM_INSTRUCTION
+        job = self.job_manager.create_job(
+            task=query, model=model, metadata={"search": True, "context_files": files}
         )
+        future = self._job_pool.submit(self._run_job, job, files, SEARCH_SYSTEM_INSTRUCTION)
         future.result()
 
         if job.status == "completed":
             return f"### Code search results\n{job.result}"
+        if job.status == "cancelled":
+            raise RuntimeError("Search was cancelled.")
         raise RuntimeError(f"Search failed: {job.error}")
 
     # -------------------------------------------------------------- responses

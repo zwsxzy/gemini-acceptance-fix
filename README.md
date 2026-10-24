@@ -107,9 +107,9 @@ Verify it is wired up by asking your client to call `list_available_models`. Wit
 | `dispatch_gemini_agent` | `task`, `context_files?`, `model?`, `system_instruction?` | Starts a background job. Returns a `job_id` immediately. |
 | `check_agent_job` | `job_id` | Status, elapsed time, progress log, and output. |
 | `list_active_jobs` | `limit?` | Recent and in-flight jobs. |
-| `cancel_agent_job` | `job_id` | Cooperatively stops a running job. |
-| `gemini_code_search` | `query`, `context_files` | Scans many files at once and answers synchronously. |
-| `list_available_models` | — | The live model catalog from your IDE session. |
+| `cancel_agent_job` | `job_id` | Cancels queued work and requests that the IDE stop an active Cascade. |
+| `gemini_code_search` | `query`, `context_files`, `model?` | Scans many files at once and answers synchronously using the selected model. |
+| `list_available_models` | — | The live model catalog from your IDE session or REST fallback. |
 
 ### Picking a model
 
@@ -141,6 +141,15 @@ Two backends, tried in order:
 
 1. **Local Antigravity language server** — the default. Connects over loopback HTTPS and reuses the IDE's signed-in session. No API key.
 2. **Gemini REST API** — used when the IDE is not running and `GEMINI_API_KEY` or `GOOGLE_API_KEY` is set.
+
+The REST fallback lists models supporting `generateContent` from the API, including
+all catalog pages. An omitted model or `"flash"` resolves against that catalog;
+exact API model IDs and `models/` resource names are also accepted. API keys are
+sent in a request header. The configured job timeout covers catalog lookup and
+generation, and empty, blocked, or truncated responses are reported as failures.
+Cancellation preserves the cancelled state even if an outstanding REST request
+subsequently returns an error; it cannot revoke a request already being processed
+by Google's servers.
 
 If neither is reachable the job fails with an error saying so. There is
 deliberately no further tier that returns a stand-in result: a plausible answer

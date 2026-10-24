@@ -8,8 +8,10 @@ The file lives in the per-user state directory, never in the install tree —
 see paths.py for why.
 """
 
+import contextlib
 import json
 import os
+import tempfile
 import threading
 import time
 import uuid
@@ -44,8 +46,13 @@ class Job:
     _cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     # Invoked after every mutating call below. Not part of persisted state.
     _on_change: Optional[Callable[[], None]] = field(default=None, repr=False, compare=False)
+    _state_lock: Any = field(default_factory=threading.RLock, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
+        with self._state_lock:
+            return self._snapshot()
+
+    def _snapshot(self) -> dict[str, Any]:
         duration = round(
             (self.finished_at or time.time()) - (self.started_at or self.created_at), 2
         )
@@ -57,7 +64,7 @@ class Job:
             "created_at": self.created_at,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
-            "duration_seconds": duration,
+            "duration_seconds": max(0.0, duration),
             "progress_logs": list(self.progress_logs),
             "result": self.result,
             "error": self.error,
@@ -87,19 +94,60 @@ class Job:
             job.error = "The MCP session ended before this job finished."
             job.finished_at = job.finished_at or time.time()
             job.log("Marked failed: session ended while job was in flight.")
+        elif job.status == "cancelled":
+            job._cancel_event.set()
         return job
 
     def log(self, message: str) -> None:
         timestamp = time.strftime("%H:%M:%S")
-        self.progress_logs.append(f"[{timestamp}] {message}")
+        with self._state_lock:
+            self.progress_logs.append(f"[{timestamp}] {message}")
+        self._notify_change()
+
+    def _notify_change(self) -> None:
+        # Never acquire the manager's lock while holding the job's lock:
+        # persistence snapshots acquire those two locks in the other order.
         if self._on_change:
             self._on_change()
 
-    def cancel(self) -> None:
-        self._cancel_event.set()
-        self.status = "cancelled"
-        self.finished_at = time.time()
+    def start(self) -> bool:
+        with self._state_lock:
+            if self.status != "pending" or self.is_cancelled():
+                return False
+            self.status = "running"
+            self.started_at = time.time()
+        self._notify_change()
+        return True
+
+    def complete(self, result: str) -> bool:
+        with self._state_lock:
+            if self.status not in ("pending", "running") or self.is_cancelled():
+                return False
+            self.result = result
+            self.status = "completed"
+            self.finished_at = time.time()
+        self._notify_change()
+        return True
+
+    def fail(self, error: str) -> bool:
+        with self._state_lock:
+            if self.status not in ("pending", "running") or self.is_cancelled():
+                return False
+            self.error = error
+            self.status = "failed"
+            self.finished_at = time.time()
+        self._notify_change()
+        return True
+
+    def cancel(self) -> bool:
+        with self._state_lock:
+            if self.status not in ("pending", "running"):
+                return False
+            self._cancel_event.set()
+            self.status = "cancelled"
+            self.finished_at = time.time()
         self.log("Job was cancelled by orchestrator.")
+        return True
 
     def is_cancelled(self) -> bool:
         return self._cancel_event.is_set()
@@ -133,17 +181,34 @@ class JobManager:
             pass
 
     def _save_to_disk(self) -> None:
+        # Serialize the whole write, not only the snapshot. Previously two
+        # threads wrote the same .tmp path concurrently and could replace an
+        # incomplete or stale snapshot. Unique temporary names also avoid
+        # collisions with another MCP process writing this state directory.
         with self._lock:
             snapshot = {"jobs": [j.to_dict() for j in self._jobs.values()]}
-        tmp_path = f"{self._state_path}.tmp"
-        try:
-            os.makedirs(os.path.dirname(self._state_path), exist_ok=True)
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(snapshot, f)
-            os.replace(tmp_path, self._state_path)
-        except Exception:
-            # Persistence is best-effort; never let a disk error break the job.
-            pass
+            tmp_path = None
+            try:
+                directory = os.path.dirname(os.path.abspath(self._state_path))
+                os.makedirs(directory, exist_ok=True)
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    dir=directory,
+                    prefix="jobs-",
+                    suffix=".tmp",
+                    delete=False,
+                ) as f:
+                    tmp_path = f.name
+                    json.dump(snapshot, f)
+                os.replace(tmp_path, self._state_path)
+            except Exception:
+                # Persistence is best-effort; never let a disk error break the job.
+                pass
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    with contextlib.suppress(OSError):
+                        os.unlink(tmp_path)
 
     def create_job(
         self, task: str, model: str = "flash", metadata: Optional[dict[str, Any]] = None
@@ -178,7 +243,4 @@ class JobManager:
     def cancel_job(self, job_id: str) -> bool:
         with self._lock:
             job = self._jobs.get(job_id)
-            if job and job.status in ("pending", "running"):
-                job.cancel()
-                return True
-            return False
+            return job.cancel() if job else False
