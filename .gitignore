@@ -25,3 +25,7 @@ jobs.json
 .idea/
 .DS_Store
 Thumbs.db
+
+# Local patch & backups
+ACTIVATE_GEMINI_FIX_*
+backup_original_installed/
